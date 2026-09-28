@@ -435,7 +435,16 @@ const list_pages: Operation = {
     // v0.29 — surface filter that already exists on PageFilters.
     updated_after: {
       type: 'string',
-      description: 'ISO date (YYYY-MM-DD) or full timestamp. Returns pages with updated_at > value.',
+      description: 'ISO date (YYYY-MM-DD) or full timestamp. Returns pages with updated_at > value. Bare (without updated_after_slug) this is LOSSY across rows sharing one timestamp — a bulk sync stamps one now() across a transaction; pair with updated_after_slug to page exactly.',
+    },
+    // Exposes the engine's v0.45.7 keyset cursor (PageFilters.updatedAfterKeyset)
+    // at the op layer. The old truncation recipe (sort=updated_asc +
+    // updated_after=<last updated_at>) silently skips every row sharing the
+    // cursor timestamp; worse, a >limit same-timestamp cluster re-selects
+    // forever. The keyset resumes strictly after (updated_at, slug).
+    updated_after_slug: {
+      type: 'string',
+      description: "Keyset cursor slug: pass the last row's slug together with updated_after set to that row's updated_at_iso (column precision — a millisecond-rounded value re-selects same-millisecond rows). Resumes strictly after (updated_at, slug) and forces sort=updated_asc.",
     },
     sort: {
       type: 'string',
@@ -460,9 +469,22 @@ const list_pages: Operation = {
     // Engines also whitelist via PAGE_SORT_SQL but defending here keeps
     // unsupported strings from reaching the SQL layer.
     const rawSort = p.sort as string | undefined;
-    const sort = rawSort && (LIST_PAGES_SORT_VALUES as readonly string[]).includes(rawSort)
+    let sort = rawSort && (LIST_PAGES_SORT_VALUES as readonly string[]).includes(rawSort)
       ? (rawSort as ListPagesSort)
       : undefined;
+    // Keyset cursor: updated_after_slug pairs with updated_after (the last
+    // row's updated_at_iso). The cursor is only coherent under the
+    // updated_asc TOTAL order (updated_at, slug tiebreaker — PAGE_SORT_SQL),
+    // so it forces that sort and supersedes the bare, lossy updated_after.
+    const updatedAfter = typeof p.updated_after === 'string' ? p.updated_after : undefined;
+    const updatedAfterSlug = typeof p.updated_after_slug === 'string' ? p.updated_after_slug : undefined;
+    if (updatedAfterSlug !== undefined && updatedAfter === undefined) {
+      throw new Error('list_pages: updated_after_slug requires updated_after (the cursor row\'s updated_at_iso).');
+    }
+    const updatedAfterKeyset = updatedAfter !== undefined && updatedAfterSlug !== undefined
+      ? { updatedAt: updatedAfter, slug: updatedAfterSlug }
+      : undefined;
+    if (updatedAfterKeyset) sort = 'updated_asc';
     // v0.34.1 (#861 — P0 leak seal): thread the auth'd client's source scope
     // into the listPages filter so an OAuth client scoped to src-A cannot
     // enumerate src-B pages. Pre-fix, ctx.sourceId / ctx.auth?.allowedSources
@@ -522,7 +544,8 @@ const list_pages: Operation = {
       limit: limit + 1,
       offset,
       includeDeleted: (p.include_deleted as boolean) === true,
-      updated_after: typeof p.updated_after === 'string' ? p.updated_after : undefined,
+      updated_after: updatedAfterKeyset ? undefined : updatedAfter,
+      updatedAfterKeyset,
       sort,
       excludePrivate,
       ...scope,
@@ -540,8 +563,9 @@ const list_pages: Operation = {
     if (truncated && isLocal && (requestedLimit === undefined || requestedLimit > limit)) {
       console.error(
         `[list_pages] output truncated at ${limit} rows (default 50). ` +
-        `Pass an explicit limit, page through with sort=updated_asc + ` +
-        `updated_after=<last row's updated_at>, or narrow with type/tag.`,
+        `Pass an explicit limit, page through with ` +
+        `updated_after=<last row's updated_at_iso> + ` +
+        `updated_after_slug=<last row's slug>, or narrow with type/tag.`,
       );
     }
     return pages.map(pg => ({
@@ -550,6 +574,10 @@ const list_pages: Operation = {
       type: pg.type,
       title: pg.title,
       updated_at: pg.updated_at,
+      // Column-precision cursor value for updated_after + updated_after_slug.
+      // updated_at (a JS Date) is millisecond-truncated, so resuming from it
+      // re-selects every row in the last row's millisecond.
+      updated_at_iso: pg.updated_at_iso,
       ...(pg.deleted_at ? { deleted_at: pg.deleted_at } : {}),
     }));
   },
